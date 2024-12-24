@@ -1,0 +1,60 @@
+(ns cloud_project_smp.client
+  (:require [clj-http.client :as client]
+            [cheshire.core :as json]
+            [clojure.edn :as edn])
+  (:import (java.io ByteArrayOutputStream ObjectOutputStream ByteArrayInputStream ObjectInputStream)))
+
+(defn serialize-java-object [obj]
+  (with-open [byte-stream (ByteArrayOutputStream.)
+              object-stream (ObjectOutputStream. byte-stream)]
+    (.writeObject object-stream obj)
+    (.flush object-stream)
+    (.toByteArray byte-stream)))
+
+(defn deserialize-java-object [bytes]
+  (with-open [byte-stream (ByteArrayInputStream. bytes)
+              object-stream (ObjectInputStream. byte-stream)]
+    (.readObject object-stream)))
+
+(defn submit-job [func args clojure-code java-object]
+  (let [url "http://localhost:1998"
+        request-body (json/generate-string
+                      (cond-> {}
+                        func (assoc :remote-func (name func) :args args)
+                        clojure-code (assoc :clojure-code clojure-code)
+                        java-object (assoc :java-object (serialize-java-object java-object))))]
+    (let [response (client/post url
+                                {:body request-body
+                                 :content-type :json
+                                 :accept :json})
+          body (-> response :body json/parse-string true)]
+      (println "Job submitted:" body)
+      (if (contains? body :error)
+        (println "Error:" (:error body))
+        (do
+          (println "Result received from server:" (:result body))
+          (:result body))))))
+
+(defn example-usage []
+  ;; Пример Clojure-кода
+  (let [code "(+ 10 2)"]
+    (println "Submitting job with Clojure code...")
+    (let [result (submit-job nil nil code nil)]
+      (println "Result of executing Clojure code:" result)))
+
+  ;; Пример вызова удаленной функции
+  (println "Submitting job with remote function...")
+  (let [result (submit-job 'add [5 7] nil nil)]
+    (println "Result of calling remote function:" result))
+
+  ;; Пример передачи Java-объекта
+  (println "Submitting job with Java object...")
+  (let [person (java.util.Date.)] ; Пример Java-объекта
+    (let [serialized-person (serialize-java-object person)]
+      (let [result (submit-job nil nil nil serialized-person)]
+        (println "Result of sending Java object:" result)
+        ;; Десериализация для проверки
+        (let [deserialized-person (deserialize-java-object serialized-person)]
+          (println "Deserialized Java object:" deserialized-person))))))
+ ;; Вызов примеров использования
+ (example-usage)
