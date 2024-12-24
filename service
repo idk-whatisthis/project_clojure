@@ -1,0 +1,99 @@
+(ns cloud_project_smp.server
+  (:require [cheshire.core :as json]
+            [ring.adapter.jetty :refer [run-jetty]]
+            [ring.util.response :refer [response]]
+            [clojure.edn :as edn])
+  (:import (java.io ByteArrayInputStream ObjectInputStream)))
+
+(def jobs (atom []))
+(def job-status (atom {}))
+(def remote-functions (atom {}))
+
+;; Регистрация удаленной функции
+(defn register-remote-function [name f]
+  (swap! remote-functions assoc name f)
+  (println "Registered remote function:" name))
+
+;; Вызов удаленной функции
+(defn call-remote-function [name args]
+  (if-let [f (get @remote-functions name)]
+    (apply f args)
+    (throw (Exception. (str "Function not found: " name)))))
+
+;; Регистрация задания
+(defn register-job [job-id job]
+  (swap! jobs conj job)
+  (swap! job-status assoc job-id {:status "registered"})
+  (println "Registered job:" job-id "Status: registered"))
+
+;; Обновление статуса задания
+(defn update-job-status [job-id status]
+  (swap! job-status assoc job-id {:status status})
+  (println "Updated job:" job-id "Status:" status))
+
+;; Выполнение Clojure-кода
+(defn execute-clojure-code [code]
+  (try
+    (eval (read-string code))
+    (catch Exception e
+      (throw (Exception. (str "Error executing code: " (.getMessage e)))))))
+
+;; Десериализация Java-объекта
+(defn deserialize-java-object [bytes]
+  (with-open [byte-stream (ByteArrayInputStream. bytes)
+              object-stream (ObjectInputStream. byte-stream)]
+    (.readObject object-stream)))
+
+;; Пример обработки больших данных
+(defn process-large-data [data]
+  (reduce + data)) ; Пример обработки: сумма всех элементов
+
+;; Обработчик задач
+(defn job-handler [req]
+  (let [body (slurp (:body req))
+        job (json/parse-string body true)
+        clojure-code (:clojure-code job)
+        remote-func (:remote-func job)
+        remote-args (:args job)
+        java-object (:java-object job)
+        job-id (str (java.util.UUID/randomUUID))] ; Генерация уникального ID
+    (register-job job-id job)
+    (println "Received job:" job)
+    (try
+      (let [result (cond
+                     remote-func (call-remote-function remote-func remote-args)
+                     clojure-code (execute-clojure-code clojure-code)
+                     java-object (process-large-data (deserialize-java-object java-object))
+                     :else (throw (Exception. "No valid job type provided.")))]
+        (update-job-status job-id "completed")
+        ;; Логирование результата
+        (println (str "Job ID: " job-id " | Result: " result))
+        (response (json/generate-string {:job-id job-id :result result})))
+      (catch Exception e
+        (update-job-status job-id "failed")
+        ;; Логирование ошибки
+        (println (str "Job ID: " job-id " | Error: " (.getMessage e)))
+        (response (json/generate-string {:job-id job-id :error (.getMessage e)}))))))
+
+;; Запуск HTTP сервера
+(defn start-server []
+  (run-jetty job-handler {:port 1996 :join? false}))
+
+;; Определение функции add
+(defn add [a b]
+  (+ a b))
+
+;; Регистрация удаленных функций
+(defn register-remote-functions []
+  (register-remote-function 'add add)
+  (register-remote-function 'process-large-data process-large-data))
+
+;; Основная функция
+(defn -main [& args]
+  ;; Регистрация удаленных функций
+  (register-remote-functions)
+  ;; Запуск сервера
+  (start-server))
+
+;; Запуск сервера
+(-main)
