@@ -66,7 +66,8 @@ Clojure поддерживает несколько форматов сериа�
 ```clojure
 (let [result (async-remote compute large-dataset)]
   (println "Task submitted")
-  (println "Result:" @result))
+  (println "Result:" @result))```
+
 ## Поддержка транспорта кода и данных
 
 ### 1. Динамическая компиляция и передача кода
