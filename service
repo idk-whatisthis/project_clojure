@@ -1,62 +1,74 @@
+```clojure
 (ns my-project.server
+  ;; Подключение необходимых библиотек для работы сервера и вспомогательных операций
   (:require [clojure.core.async :refer [chan go timeout <!]]
-            [cheshire.core :as json]
-            [ring.adapter.jetty :refer [run-jetty]]
+            [cheshire.core :as json] ;; Работа с JSON
+            [ring.adapter.jetty :refer [run-jetty]] ;; Сервер Jetty
             [ring.util.response :as resp]
-            [ring.util.response :refer [response]]
-            [clojure.edn :as edn]
-            [clojure.java.io :as io]
-            [clj-http.client :as client]);; Удалены зависимости SLF4J
+            [ring.util.response :refer [response]] ;; Формирование HTTP-ответов
+            [clojure.edn :as edn] ;; Работа с EDN
+            [clojure.java.io :as io] ;; Работа с файловой системой
+            [clj-http.client :as client]) ;; HTTP-клиент для отправки запросов
   (:import (ch.qos.logback.classic Level)
            (org.slf4j LoggerFactory)))
 
+;; Имя файла, в котором хранятся данные о серверах
 (def servers-file "servers.edn")
+
+;; Атомы для хранения информации о заданиях, их статусах и зарегистрированных функциях
 (def jobs (atom []))
 (def job-status (atom {}))
 (def remote-functions (atom {}))
 
+;; Вызывает удалённую функцию по её имени и аргументам
 (defn call-remote-function [name args]
   (if-let [f (get @remote-functions name)]
     (apply f args)
     (throw (Exception. (str "Function not found: " name)))))
 
+;; Регистрирует новое задание
 (defn register-job [job-id job]
-  (swap! jobs conj job)
-  (swap! job-status assoc job-id {:status "registered"})
+  (swap! jobs conj job) ;; Добавляем задание в список
+  (swap! job-status assoc job-id {:status "registered"}) ;; Обновляем статус задания
   (println "Registered job:" job-id "Status: registered"))
 
+;; Обновляет статус задания
 (defn update-job-status [job-id status]
   (swap! job-status assoc job-id {:status status})
   (println "Updated job:" job-id "Status:" status))
 
+;; Создаёт файл для хранения информации о серверах, если его ещё нет
 (defn ensure-servers-file []
   (when-not (.exists (io/file servers-file))
-    (spit servers-file "[]")
+    (spit servers-file "[]") ;; Создаём пустой JSON-массив
     (println "Created servers file at:" servers-file)))
 
+;; Обновляет нагрузку на сервер
 (defn update-server-load [server-id delta]
-  (ensure-servers-file)
+  (ensure-servers-file) ;; Проверяем, что файл существует
   (let [servers (edn/read-string (slurp servers-file))
         updated-servers (mapv (fn [s]
                                 (if (= (:id s) server-id)
                                   (update s :load + delta)
                                   s))
                               servers)]
-    (spit servers-file (pr-str updated-servers))
+    (spit servers-file (pr-str updated-servers)) ;; Записываем обновлённые данные в файл
     (println "Updated server load for" server-id "by" delta)))
 
+;; Регистрирует новую удалённую функцию
 (defn register-remote-function [name f]
-  (swap! remote-functions assoc name f)
+  (swap! remote-functions assoc name f) ;; Добавляем функцию в атом
   (println "Registered remote function:" name))
 
+;; Обрабатывает регистрацию функции на сервере
 (defn register-function-handler [req server-id]
   (let [body (slurp (:body req))
-        func-data (json/parse-string body true)
+        func-data (json/parse-string body true) ;; Парсим данные из запроса
         func-name (:name func-data)
         func-code (:code func-data)
         job-id (java.util.UUID/randomUUID)]
-
     (try
+      ;; Пробуем выполнить код и зарегистрировать функцию
       (let [func (eval (read-string func-code))]
         (register-remote-function (symbol func-name) func)
         (update-job-status job-id "registered")
@@ -66,12 +78,12 @@
         (update-job-status job-id "failed")
         (response (json/generate-string {:error (.getMessage e)}))))))
 
-
+;; Обрабатывает задания, отправленные на сервер
 (defn job-handler [req server-id]
   (let [uri (:uri req)]
     (if (= uri "/register-function")
-      (register-function-handler req server-id)
-      ;; Остальная логика
+      (register-function-handler req server-id) ;; Обрабатываем регистрацию функции
+      ;; Обрабатываем выполнение задания
       (let [body (slurp (:body req))
             job (json/parse-string body true)
             remote-func (:remote-func job)
@@ -81,23 +93,24 @@
             job-id (java.util.UUID/randomUUID)]
 
         (register-job job-id job)
-        (update-server-load server-id 1)
+        (update-server-load server-id 1) ;; Увеличиваем нагрузку на сервер
 
         (try
           (let [result (cond
-                         remote-func (call-remote-function (symbol remote-func) args)
-                         clojure-code (eval (read-string clojure-code))
+                         remote-func (call-remote-function (symbol remote-func) args) ;; Выполняем удалённую функцию
+                         clojure-code (eval (read-string clojure-code)) ;; Выполняем код на Clojure
                          java-object (let [parsed-java-object (json/parse-string java-object true)]
-                                       (str "Java object - Name: " (:name parsed-java-object) ", Age: " (:age parsed-java-object)))
+                                       (str "Java object - Name: " (:name parsed-java-object) ", Age: " (:age parsed-java-object))) ;; Обрабатываем Java-объект
                          :else (throw (Exception. "Invalid job type")))]
-            (update-server-load server-id -1)
+            (update-server-load server-id -1) ;; Уменьшаем нагрузку на сервер
             (response (json/generate-string {:result result})))
           (catch Exception e
-            (update-server-load server-id -1)
+            (update-server-load server-id -1) ;; Уменьшаем нагрузку на сервер в случае ошибки
             (println "Job failed:" job-id "Error:" (.getMessage e))
             (update-job-status job-id "failed")
             (response (json/generate-string {:error (.getMessage e)}))))))))
 
+;; Проверяет, доступна ли функция на сервере
 (defn check-function-handler [req]
   (let [func-name (get-in req [:query-params :func])]
     (if (nil? func-name)
@@ -106,50 +119,57 @@
         (response (json/generate-string {:available true}))
         (response (json/generate-string {:available false}))))))
 
+;; Настраивает уровень логирования для сервера
 (defn configure-logging []
   (let [logger (LoggerFactory/getLogger "org.eclipse.jetty")]
     (.setLevel logger Level/WARN)))
 
+;; Запускает сервер и регистрирует его в системе
 (defn start-server []
   (let [server-id (str (java.util.UUID/randomUUID))
         keep-alive-ch (chan)
         server (run-jetty
                 (fn [req]
                   (cond
-                    (= (:uri req) "/check-function") (check-function-handler req)
-                    (= (:uri req) "/keep-alive") (do
+                    (= (:uri req) "/check-function") (check-function-handler req) ;; Обработка проверки функций
+                    (= (:uri req) "/keep-alive") (do ;; Обработка сигнала keep-alive
                                                    (println "Received keep-alive signal")
                                                    (update-server-load server-id -1)
                                                    (response (json/generate-string {:status "OK"})))
-                    :else (job-handler req server-id)))
+                    :else (job-handler req server-id))) ;; Обработка задания
                 {:port 0 :join? false})
         port (-> server .getConnectors first .getLocalPort)]
 
-    (ensure-servers-file)
+    (ensure-servers-file) ;; Проверяем, что файл серверов существует
     (let [servers (edn/read-string (slurp servers-file))
           server-info {:id server-id :port port :load 0}]
-      (spit servers-file (pr-str (conj servers server-info)))
+      (spit servers-file (pr-str (conj servers server-info))) ;; Регистрируем сервер
       (println "Server registered with ID:" server-id "on port:" port))
 
-    ;; Start a background task to send keep-alive signals
+    ;; Фоновое задание для отправки keep-alive сигналов
     (go
       (loop []
-        (<! (timeout (* 30 60 1000))) ;; Wait for 30 minutes
-        (client/get (str "http://localhost:" port "/keep-alive")) ;; Send keep-alive signal
+        (<! (timeout (* 30 60 1000))) ;; Ожидание 30 минут
+        (client/get (str "http://localhost:" port "/keep-alive")) ;; Отправка keep-alive
         (recur)))
 
     server))
 
-
+;; Пример функции сложения
 (defn add [a b]
   (+ a b))
 
+;; Регистрация примера удалённой функции
 (defn register-remote-functions []
   (register-remote-function 'add add))
 
+;; Основной вход в приложение
 (defn -main [& args]
-  (configure-logging)
-  (register-remote-functions)
-  (start-server))
+  (configure-logging) ;; Настраиваем логирование
+  (register-remote-functions) ;; Регистрируем функции
+  (start-server)) ;; Запускаем сервер
 
 (-main)
+```
+
+Этот код теперь снабжен подробными комментариями, объясняющими работу каждой функции и ключевых действий.
