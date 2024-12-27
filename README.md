@@ -32,10 +32,30 @@
 ### 1. Декларация удаленно исполняемых функций
 Для упрощения создания распределенных задач используются функции/макросы, позволяющие декларативно описывать удаленно исполняемые операции. Пример:
 ```clojure
-@remote
-(def compute [data]
-  ;; Логика вычислений
-  )
+;; Регистрация удалённой функции на сервере
+(defn register-remote-function [name f]
+  (swap! remote-functions assoc name f)
+  (println "Registered remote function:" name))
+
+;; Обработчик для регистрации функции, который принимает код функции через запрос
+(defn register-function-handler [req server-id]
+  (let [body (slurp (:body req))
+        func-data (json/parse-string body true)
+        func-name (:name func-data)
+        func-code (:code func-data)
+        job-id (java.util.UUID/randomUUID)]
+    (try
+      (let [func (eval (read-string func-code))]  ;; Выполнение кода функции
+        (register-remote-function (symbol func-name) func)
+        (update-job-status job-id "registered")
+        (response (json/generate-string {:status "Function registered" :name func-name})))
+      (catch Exception e
+        (println "Failed to register function:" (.getMessage e))
+        (update-job-status job-id "failed")
+        (response (json/generate-string {:error (.getMessage e)}))))))
+
+;; Пример регистрации функции с кодом
+(register-remote-function "add" (fn [a b] (+ a b)))
 ```
 ## 2. Параллельное исполнение (map-reduce)
 Функция `map` расширяется для распределенного исполнения:
@@ -65,9 +85,22 @@ Clojure поддерживает несколько форматов сериа�
 
 Пример асинхронного вызова:
 ```clojure
-(let [result (async-remote compute large-dataset)]
-  (println "Task submitted")
-  (println "Result:" @result))
+;; Параллельное выполнение map с использованием канала для асинхронной обработки
+(defn parallel-map [func args]
+  (let [results (atom (vec (repeat (count args) nil)))  ;; Состояние результатов
+        jobs (chan)]  ;; Канал для отслеживания завершения задач
+    (doseq [idx (range (count args))]
+      (let [arg (nth args idx)]
+        (go
+          (let [result (submit-job func [arg arg] nil nil)]  ;; Асинхронный вызов задачи
+            (when result
+              (swap! results assoc idx (:result result))  ;; Сохранение результата
+              (>! jobs :done)))))  ;; Завершение задачи в канале
+    ;; Ожидание завершения всех задач
+    (go
+      (dotimes [_ (count args)]
+        (<! jobs))  ;; Ожидание завершения каждой задачи
+      @results))  ;; Возврат всех результатов
 ```
 ## Поддержка транспорта кода и данных
 
