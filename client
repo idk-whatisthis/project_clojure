@@ -1,20 +1,10 @@
-(ns project-smp.client
+(ns my-project.client
   (:require [cheshire.core :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clj-http.client :as client]
-            [clojure.core.async :as async :refer [<! >! go chan]]))
-
-(import '[org.apache.log4j PropertyConfigurator])
-
-(defn init-logging []
-  (let [config-file "log4j.properties"]
-    (when (.exists (io/file config-file))
-      (PropertyConfigurator/configure config-file))))
-
-;; Вызовите инициализацию логирования в начале вашего кода
-(init-logging)
-
+            [clojure.core.async :as async :refer [<! >! go chan]]
+            [clojure.core.async :refer [chan go <! >! close!]]))
 
 (import '[java.net Socket])
 
@@ -69,29 +59,33 @@
 (defn submit-job [func args clojure-code java-object]
   (let [server (choose-server func)]
     (if server
-      (try
-        (let [url (str "http://localhost:" (:port server))
-              request-body (json/generate-string
-                             (cond-> {}
-                                     func (assoc :remote-func (name func) :args args)
-                                     clojure-code (assoc :clojure-code clojure-code)
-                                     java-object (assoc :java-object (serialize-java-object-to-string java-object))))]
-          (println "Connecting to server at:" url)
-          (let [response (client/post url
-                                      {:body request-body
-                                       :headers {"Content-Type" "application/json"}})]
+      (let [url (str "http://localhost:" (:port server))
+            request-body (json/generate-string
+                          (cond-> {}
+                            func (assoc :remote-func (name func) :args args)
+                            clojure-code (assoc :clojure-code clojure-code)
+                            java-object (assoc :java-object (serialize-java-object-to-string java-object))))
+            response-chan (chan)]
+        (go
+          (let [response (<! (async/thread
+                               (client/post url
+                                            {:body request-body
+                                             :headers {"Content-Type" "application/json"}})))]
             (if (= 200 (:status response))
               (let [result (json/parse-string (:body response) true)]
                 (when result
                   (println "Result:" result))
-                result)
+                (>! response-chan result) ;; Отправляем результат в канал
+                (close! response-chan))  ;; Закрываем канал после отправки результата
               (do
                 (println "Failed to submit job:" (:status response) (:body response))
-                nil))))
-        (catch Exception e
-          (println "Connection error:" (.getMessage e))
-          nil))
-      (println "No server selected. Job not submitted."))))
+                (>! response-chan nil) ;; Отправляем nil в канал в случае ошибки
+                (close! response-chan))) ;; Закрываем канал
+            ))
+        response-chan)
+      (do
+        (println "No server selected. Job not submitted.")
+        nil))))
 
 (defn register-remote-function [name code]
   (let [server (choose-server nil)]
@@ -120,7 +114,7 @@
     (doseq [idx (range (count args))]
       (let [arg (nth args idx)]
         (go
-          (let [result (submit-job func [arg arg] nil nil)] ;; Передаем два аргумента
+          (let [result (<! (submit-job func [arg arg] nil nil))] ;; Передаем два аргумента
             (when result
               (swap! results assoc idx (:result result))
               (>! jobs :done))))))
