@@ -1,60 +1,178 @@
-(ns cloud_project_smp.client
-  (:require [clj-http.client :as client]
-            [cheshire.core :as json]
-            [clojure.edn :as edn])
-  (:import (java.io ByteArrayOutputStream ObjectOutputStream ByteArrayInputStream ObjectInputStream)))
+(ns project-smp.client
+  (:require [cheshire.core :as json]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clj-http.client :as client]
+            [clojure.core.async :as async :refer [<! >! go chan]]))
 
-(defn serialize-java-object [obj]
-  (with-open [byte-stream (ByteArrayOutputStream.)
-              object-stream (ObjectOutputStream. byte-stream)]
-    (.writeObject object-stream obj)
-    (.flush object-stream)
-    (.toByteArray byte-stream)))
+(import '[org.apache.log4j PropertyConfigurator])
 
-(defn deserialize-java-object [bytes]
-  (with-open [byte-stream (ByteArrayInputStream. bytes)
-              object-stream (ObjectInputStream. byte-stream)]
-    (.readObject object-stream)))
+(defn init-logging []
+  (let [config-file "log4j.properties"]
+    (when (.exists (io/file config-file))
+      (PropertyConfigurator/configure config-file))))
+
+;; Вызовите инициализацию логирования в начале вашего кода
+(init-logging)
+
+
+(import '[java.net Socket])
+
+(def servers-file "servers.edn")
+
+(defn get-available-servers []
+  (try
+    (when (.exists (io/file servers-file))
+      (let [servers (edn/read-string (slurp servers-file))]
+        (println "Available servers:" servers)
+        servers))
+    (catch Exception e
+      (println "Failed to read servers list:" (.getMessage e))
+      [])))
+
+(defn is-server-active? [server]
+  (try
+    (with-open [socket (Socket. "localhost" (:port server))]
+      true)
+    (catch Exception e
+      false)))
+
+(defn is-code-deployed? [server func]
+  (if (nil? func)
+    false
+    (try
+      (let [url (str "http://localhost:" (:port server) "/check-function")
+            response (client/get url {:query-params {:func (name func)}})]
+        (= 200 (:status response)))
+      (catch Exception e
+        (println "Error checking function deployment:" (.getMessage e))
+        false))))
+
+(defn choose-server [func]
+  (let [servers (get-available-servers)]
+    (if (empty? servers)
+      (do
+        (println "No available servers.")
+        nil)
+      (let [active-servers (filter #(is-server-active? %) servers)]
+        (if (empty? active-servers)
+          (do
+            (println "No suitable servers available.")
+            nil)
+          (let [selected-server (apply min-key :load active-servers)]
+            (println "Selected server:" selected-server)
+            selected-server))))))
+
+(defn serialize-java-object-to-string [obj]
+  (json/generate-string obj))
 
 (defn submit-job [func args clojure-code java-object]
-  (let [url "http://localhost:1998"
-        request-body (json/generate-string
-                      (cond-> {}
-                        func (assoc :remote-func (name func) :args args)
-                        clojure-code (assoc :clojure-code clojure-code)
-                        java-object (assoc :java-object (serialize-java-object java-object))))]
-    (let [response (client/post url
-                                {:body request-body
-                                 :content-type :json
-                                 :accept :json})
-          body (-> response :body json/parse-string true)]
-      (println "Job submitted:" body)
-      (if (contains? body :error)
-        (println "Error:" (:error body))
-        (do
-          (println "Result received from server:" (:result body))
-          (:result body))))))
+  (let [server (choose-server func)]
+    (if server
+      (try
+        (let [url (str "http://localhost:" (:port server))
+              request-body (json/generate-string
+                             (cond-> {}
+                                     func (assoc :remote-func (name func) :args args)
+                                     clojure-code (assoc :clojure-code clojure-code)
+                                     java-object (assoc :java-object (serialize-java-object-to-string java-object))))]
+          (println "Connecting to server at:" url)
+          (let [response (client/post url
+                                      {:body request-body
+                                       :headers {"Content-Type" "application/json"}})]
+            (if (= 200 (:status response))
+              (let [result (json/parse-string (:body response) true)]
+                (when result
+                  (println "Result:" result))
+                result)
+              (do
+                (println "Failed to submit job:" (:status response) (:body response))
+                nil))))
+        (catch Exception e
+          (println "Connection error:" (.getMessage e))
+          nil))
+      (println "No server selected. Job not submitted."))))
 
-(defn example-usage []
-  ;; Пример Clojure-кода
+(defn register-remote-function [name code]
+  (let [server (choose-server nil)]
+    (if server
+      (try
+        (let [url (str "http://localhost:" (:port server) "/register-function")
+              request-body (json/generate-string {:name name :code code})]
+          (println "Registering function..." name)
+          (let [response (client/post url
+                                      {:body request-body
+                                       :headers {"Content-Type" "application/json"}})]
+            (if (= 200 (:status response))
+              (println "Function registered:" name)
+              (println "Failed to register function:" (:status response) (:body response)))))
+        (catch Exception e
+          (println "Connection error:" (.getMessage e))))
+      (println "No server selected. Function not registered."))))
+
+;; Пример использования
+(register-remote-function "subtract" "(fn [a b] (- a b))") ;; Регистрация функции вычитания
+
+;; Параллельное выполнение map
+(defn parallel-map [func args]
+  (let [results (atom (vec (repeat (count args) nil)))
+        jobs (chan)]
+    (doseq [idx (range (count args))]
+      (let [arg (nth args idx)]
+        (go
+          (let [result (submit-job func [arg arg] nil nil)] ;; Передаем два аргумента
+            (when result
+              (swap! results assoc idx (:result result))
+              (>! jobs :done))))))
+    ;; Ждем завершения всех задач
+    (go
+      (dotimes [_ (count args)]
+        (<! jobs))
+      @results)))
+
+;; Пример отправки Clojure-кода
+(defn submit-clojure-code-example []
   (let [code "(+ 10 2)"]
-    (println "Submitting job with Clojure code...")
+    (println "Submitting Clojure code...")
     (let [result (submit-job nil nil code nil)]
-      (println "Result of executing Clojure code:" result)))
+      (when result
+        (println "Result of executing Clojure code:" result)))))
 
-  ;; Пример вызова удаленной функции
-  (println "Submitting job with remote function...")
-  (let [result (submit-job 'add [5 7] nil nil)]
-    (println "Result of calling remote function:" result))
+;; Пример отправки Java-объекта
+(defn submit-java-object-example []
+  (let [person {:name "Alice" :age 30}]
+    (println "Submitting Java object...")
+    (let [result (submit-job nil nil nil person)]
+      (when result
+        (println "Result of sending Java object:" result)))))
 
-  ;; Пример передачи Java-объекта
-  (println "Submitting job with Java object...")
-  (let [person (java.util.Date.)] ; Пример Java-объекта
-    (let [serialized-person (serialize-java-object person)]
-      (let [result (submit-job nil nil nil serialized-person)]
-        (println "Result of sending Java object:" result)
-        ;; Десериализация для проверки
-        (let [deserialized-person (deserialize-java-object serialized-person)]
-          (println "Deserialized Java object:" deserialized-person))))))
- ;; Вызов примеров использования
- (example-usage)
+(defn submit-remote-function-example []
+  (let [func 'add  ;; Убедитесь, что здесь указано имя функции как символ
+        args [6 7]]
+    (println "Submitting remote function...")
+    (let [result (submit-job func args nil nil)]
+      (when result
+        (println "Result of remote function:" (:result result))))))
+
+;; Пример использования parallel-map
+(defn submit-parallel-map-example []
+  (let [func 'add
+        args [1 2 3 4 5]]
+    (println "Submitting parallel map...")
+    (let [results (parallel-map func args)]
+      (println "Results of parallel map:" results))))
+
+;; Пример отправки удаленной функции
+(defn submit-remote-function-example_new []
+  (let [func 'subtract  ;; Убедитесь, что здесь указано имя функции как символ
+        args [17 7]]
+    (println "Submitting remote function...")
+    (let [result (submit-job func args nil nil)]
+      (when result
+        (println "Result of remote function:" (:result result))))))
+
+(submit-clojure-code-example)
+(submit-java-object-example)
+(submit-remote-function-example)
+(submit-parallel-map-example)
+(submit-remote-function-example_new)
