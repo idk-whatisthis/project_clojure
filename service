@@ -1,99 +1,151 @@
-(ns cloud_project_smp.server
-  (:require [cheshire.core :as json]
+(ns project-smp.server
+  (:require [clojure.core.async :refer [chan go timeout <!]]
+            [cheshire.core :as json]
             [ring.adapter.jetty :refer [run-jetty]]
+            [ring.util.response :as resp]
             [ring.util.response :refer [response]]
-            [clojure.edn :as edn])
-  (:import (java.io ByteArrayInputStream ObjectInputStream)))
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clj-http.client :as client])) ;; Удалены зависимости SLF4J
 
+(def servers-file "servers.edn")
 (def jobs (atom []))
 (def job-status (atom {}))
 (def remote-functions (atom {}))
 
-;; Регистрация удаленной функции
+(defn ensure-servers-file []
+  (when-not (.exists (io/file servers-file))
+    (spit servers-file "[]")
+    (println "Created servers file at:" servers-file)))
+
+(defn update-server-load [server-id delta]
+  (ensure-servers-file)
+  (let [servers (edn/read-string (slurp servers-file))
+        updated-servers (mapv (fn [s]
+                                (if (= (:id s) server-id)
+                                  (update s :load + delta)
+                                  s))
+                              servers)]
+    (spit servers-file (pr-str updated-servers))
+    (println "Updated server load for" server-id "by" delta)))
+
 (defn register-remote-function [name f]
   (swap! remote-functions assoc name f)
   (println "Registered remote function:" name))
 
-;; Вызов удаленной функции
+(defn register-function-handler [req server-id]
+  (let [body (slurp (:body req))
+        func-data (json/parse-string body true)
+        func-name (:name func-data)
+        func-code (:code func-data)
+        job-id (java.util.UUID/randomUUID)]
+
+    (try
+      (let [func (eval (read-string func-code))]
+        (register-remote-function (symbol func-name) func)
+        (update-job-status job-id "registered")
+        (response (json/generate-string {:status "Function registered" :name func-name})))
+      (catch Exception e
+        (println "Failed to register function:" (.getMessage e))
+        (update-job-status job-id "failed")
+        (response (json/generate-string {:error (.getMessage e)}))))))
+
+
+
 (defn call-remote-function [name args]
   (if-let [f (get @remote-functions name)]
     (apply f args)
     (throw (Exception. (str "Function not found: " name)))))
 
-;; Регистрация задания
 (defn register-job [job-id job]
   (swap! jobs conj job)
   (swap! job-status assoc job-id {:status "registered"})
   (println "Registered job:" job-id "Status: registered"))
 
-;; Обновление статуса задания
 (defn update-job-status [job-id status]
   (swap! job-status assoc job-id {:status status})
   (println "Updated job:" job-id "Status:" status))
 
-;; Выполнение Clojure-кода
-(defn execute-clojure-code [code]
-  (try
-    (eval (read-string code))
-    (catch Exception e
-      (throw (Exception. (str "Error executing code: " (.getMessage e)))))))
+(defn job-handler [req server-id]
+  (let [uri (:uri req)]
+    (if (= uri "/register-function")
+      (register-function-handler req server-id)
+      ;; Остальная логика
+      (let [body (slurp (:body req))
+            job (json/parse-string body true)
+            remote-func (:remote-func job)
+            args (:args job)
+            clojure-code (:clojure-code job)
+            job-id (java.util.UUID/randomUUID)]
 
-;; Десериализация Java-объекта
-(defn deserialize-java-object [bytes]
-  (with-open [byte-stream (ByteArrayInputStream. bytes)
-              object-stream (ObjectInputStream. byte-stream)]
-    (.readObject object-stream)))
+        (register-job job-id job)
+        (update-server-load server-id 1)
 
-;; Пример обработки больших данных
-(defn process-large-data [data]
-  (reduce + data)) ; Пример обработки: сумма всех элементов
+        (try
+          (let [result (cond
+                         remote-func (call-remote-function (symbol remote-func) args)
+                         clojure-code (eval (read-string clojure-code))
+                         :else (throw (Exception. "Invalid job type")))]
+            (update-server-load server-id -1)
+            (response (json/generate-string {:result result})))
+          (catch Exception e
+            (update-server-load server-id -1)
+            (println "Job failed:" job-id "Error:" (.getMessage e))
+            (update-job-status job-id "failed")
+            (response (json/generate-string {:error (.getMessage e)}))))))))
 
-;; Обработчик задач
-(defn job-handler [req]
-  (let [body (slurp (:body req))
-        job (json/parse-string body true)
-        clojure-code (:clojure-code job)
-        remote-func (:remote-func job)
-        remote-args (:args job)
-        java-object (:java-object job)
-        job-id (str (java.util.UUID/randomUUID))] ; Генерация уникального ID
-    (register-job job-id job)
-    (println "Received job:" job)
-    (try
-      (let [result (cond
-                     remote-func (call-remote-function remote-func remote-args)
-                     clojure-code (execute-clojure-code clojure-code)
-                     java-object (process-large-data (deserialize-java-object java-object))
-                     :else (throw (Exception. "No valid job type provided.")))]
-        (update-job-status job-id "completed")
-        ;; Логирование результата
-        (println (str "Job ID: " job-id " | Result: " result))
-        (response (json/generate-string {:job-id job-id :result result})))
-      (catch Exception e
-        (update-job-status job-id "failed")
-        ;; Логирование ошибки
-        (println (str "Job ID: " job-id " | Error: " (.getMessage e)))
-        (response (json/generate-string {:job-id job-id :error (.getMessage e)}))))))
+(defn check-function-handler [req]
+  (let [func-name (get-in req [:query-params :func])]
+    (if (nil? func-name)
+      (response (json/generate-string {:available false :error "Function name cannot be nil"}))
+      (if (contains? @remote-functions (symbol func-name))
+        (response (json/generate-string {:available true}))
+        (response (json/generate-string {:available false}))))))
 
-;; Запуск HTTP сервера
+
+
+;; (defn configure-logging []
+;; (let [logger (LoggerFactory/getLogger "org.eclipse.jetty")]
+;; (.setLevel logger Level/WARN)))
+
 (defn start-server []
-  (run-jetty job-handler {:port 1996 :join? false}))
+  (let [server-id (str (java.util.UUID/randomUUID))
+        keep-alive-ch (chan)
+        server (run-jetty
+                 (fn [req]
+                   (cond
+                     (= (:uri req) "/check-function") (check-function-handler req)
+                     (= (:uri req) "/keep-alive") (do
+                                                    (println "Received keep-alive signal")
+                                                    (update-server-load server-id -1)
+                                                    (response (json/generate-string {:status "OK"})))
+                     :else (job-handler req server-id)))
+                 {:port 0 :join? false})
+        port (-> server .getConnectors first .getLocalPort)]
 
-;; Определение функции add
+    (ensure-servers-file)
+    (let [servers (edn/read-string (slurp servers-file))
+          server-info {:id server-id :port port :load 0}]
+      (spit servers-file (pr-str (conj servers server-info)))
+      (println "Server registered with ID:" server-id "on port:" port))
+
+    ;; Start a background task to send keep-alive signals
+    (go
+      (loop []
+        (update-server-load server-id 1)
+        (<! (timeout (* 29 60 1000))) ;; Wait for 29 minutes and 59 seconds
+        (recur)))
+
+    server))
+
 (defn add [a b]
   (+ a b))
 
-;; Регистрация удаленных функций
 (defn register-remote-functions []
-  (register-remote-function 'add add)
-  (register-remote-function 'process-large-data process-large-data))
+  (register-remote-function 'add add))
 
-;; Основная функция
 (defn -main [& args]
-  ;; Регистрация удаленных функций
   (register-remote-functions)
-  ;; Запуск сервера
   (start-server))
 
-;; Запуск сервера
 (-main)
