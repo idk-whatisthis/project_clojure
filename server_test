@@ -88,7 +88,7 @@
     (println "After registration, remote functions:" @remote-functions) ;; Отладка
 
     ;; Проверка существующей функции
-    (let [check-req {:query-params {"func" "add"}} ;; Убедитесь, что здесь правильно указано имя функции
+    (let [check-req {:query-params {"func" "add"}} 
           response (check-function-handler check-req)]
       (println "Checking function with name:" "add") ;; Отладка
       (println "Response for existing function:" (json/parse-string (:body response) true))
@@ -104,6 +104,7 @@
 
 
 (run-tests)
+
 
 
 
