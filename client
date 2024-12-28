@@ -1,178 +1,167 @@
-(ns my-project.client
-  ;; Подключение необходимых библиотек
-  (:require [cheshire.core :as json] ;; Работа с JSON
-            [clojure.edn :as edn] ;; Работа с EDN
-            [clojure.java.io :as io] ;; Работа с файловой системой
-            [clj-http.client :as client] ;; HTTP-клиент для запросов
-            [clojure.core.async :as async :refer [<! >! go chan close!]])) ;; Асинхронные каналы
+(ns project-smp.client
+  (:require [cheshire.core :as json]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clj-http.client :as client]
+            [clojure.core.async :as async :refer [<! >! go chan]]
+            [clojure.core.async :refer [chan go <! >! close!]]))  ;; Подключаем библиотеки для работы с асинхронностью и HTTP
 
-;; Импорт класса для работы с сокетами
-(import '[java.net Socket])
+(import '[java.net Socket])  ;; Импортируем класс Socket для проверки доступности серверов
 
-;; Путь к файлу с данными о серверах
-(def servers-file "servers.edn")
+(def servers-file "servers.edn")  ;; Определяем файл для хранения информации о серверах
 
-;; Чтение списка доступных серверов из файла
+;; Функция для получения списка доступных серверов
 (defn get-available-servers []
   (try
-    (when (.exists (io/file servers-file)) ;; Проверяем существование файла
-      (let [servers (edn/read-string (slurp servers-file))] ;; Читаем данные
-        (println "Available servers:" servers)
-        servers)) ;; Возвращаем список серверов
+    (when (.exists (io/file servers-file))  ;; Проверяем, существует ли файл с серверами
+      (let [servers (edn/read-string (slurp servers-file))]  ;; Читаем данные из файла
+        (println "Available servers:" servers)  ;; Выводим доступные серверы
+        servers))  ;; Возвращаем список серверов
     (catch Exception e
-      (println "Failed to read servers list:" (.getMessage e))
-      []))) ;; В случае ошибки возвращаем пустой список
+      (println "Failed to read servers list:" (.getMessage e))  ;; Обрабатываем ошибку чтения файла
+      [])))  ;; Если произошла ошибка, возвращаем пустой список
 
-;; Проверяет, активен ли сервер
+;; Функция для проверки активности сервера
 (defn is-server-active? [server]
   (try
-    (with-open [socket (Socket. "localhost" (:port server))] ;; Пробуем подключиться к серверу
-      true) ;; Если получилось, сервер активен
+    (with-open [socket (Socket. "localhost" (:port server))]  ;; Пытаемся открыть сокет на сервере
+      true)  ;; Если соединение успешно, сервер активен
     (catch Exception e
-      false))) ;; В случае ошибки сервер не активен
+      false)))  ;; Если соединение не удалось, сервер неактивен
 
-;; Проверяет, развернута ли функция на сервере
-(defn is-code-deployed? [server func]
-  (if (nil? func)
-    false ;; Если функция не задана, возвращаем false
-    (try
-      (let [url (str "http://localhost:" (:port server) "/check-function") ;; URL для проверки функции
-            response (client/get url {:query-params {:func (name func)}})] ;; Отправляем запрос
-        (= 200 (:status response))) ;; Проверяем статус ответа
-      (catch Exception e
-        (println "Error checking function deployment:" (.getMessage e))
-        false)))) ;; Если ошибка, считаем, что функция не развернута
-
-;; Выбирает сервер для выполнения задания
+;; Функция для выбора сервера с наименьшей нагрузкой
 (defn choose-server [func]
-  (let [servers (get-available-servers)] ;; Получаем список серверов
-    (if (empty? servers)
+  (let [servers (get-available-servers)]  ;; Получаем список доступных серверов
+    (if (empty? servers)  ;; Если серверов нет
       (do
-        (println "No available servers.")
-        nil) ;; Если серверов нет, возвращаем nil
-      (let [active-servers (filter #(is-server-active? %) servers)] ;; Фильтруем активные серверы
-        (if (empty? active-servers)
+        (println "No available servers.")  ;; Сообщаем, что серверы не найдены
+        nil)
+      (let [active-servers (filter #(is-server-active? %) servers)]  ;; Фильтруем активные серверы
+        (if (empty? active-servers)  ;; Если нет активных серверов
           (do
-            (println "No suitable servers available.")
-            nil) ;; Если активных серверов нет, возвращаем nil
-          (let [selected-server (apply min-key :load active-servers)] ;; Выбираем сервер с минимальной нагрузкой
-            (println "Selected server:" selected-server)
+            (println "No suitable servers available.")  ;; Сообщаем, что подходящих серверов нет
+            nil)
+          (let [selected-server (apply min-key :load active-servers)]  ;; Выбираем сервер с наименьшей нагрузкой
+            (println "Selected server:" selected-server)  ;; Выводим информацию о выбранном сервере
             selected-server))))))
 
-;; Сериализует Java-объект в строку JSON
+;; Функция для сериализации объекта Java в строку
 (defn serialize-java-object-to-string [obj]
-  (json/generate-string obj)) ;; Используем cheshire для сериализации
+  (json/generate-string obj))  ;; Используем библиотеку Cheshire для преобразования объекта в строку JSON
 
-;; Отправляет задание на сервер
+;; Функция для отправки задания на выполнение на сервер
 (defn submit-job [func args clojure-code java-object]
-  (let [server (choose-server func)] ;; Выбираем сервер для выполнения задания
-    (if server
-      (let [url (str "http://localhost:" (:port server)) ;; Формируем URL
-            request-body (json/generate-string ;; Формируем тело запроса
-                          (cond-> {}
-                            func (assoc :remote-func (name func) :args args)
-                            clojure-code (assoc :clojure-code clojure-code)
-                            java-object (assoc :java-object (serialize-java-object-to-string java-object))))
-            response-chan (chan)] ;; Создаем канал для получения результата
-        (go
+  (let [server (choose-server func)]  ;; Выбираем сервер для выполнения задания
+    (if server  ;; Если сервер выбран
+      (let [url (str "http://localhost:" (:port server))  ;; Формируем URL сервера
+            request-body (json/generate-string
+                           (cond-> {}
+                                   func (assoc :remote-func (name func) :args args)
+                                   clojure-code (assoc :clojure-code clojure-code)
+                                   java-object (assoc :java-object (serialize-java-object-to-string java-object))))  ;; Формируем тело запроса
+            response-chan (chan)]  ;; Канал для получения ответа
+
+        (go  ;; Запускаем асинхронную задачу
           (let [response (<! (async/thread
-                               (client/post url ;; Отправляем запрос на выполнение задания
+                               (client/post url  ;; Отправляем HTTP POST запрос на сервер
                                             {:body request-body
-                                             :headers {"Content-Type" "application/json"}})))]
-            (if (= 200 (:status response)) ;; Проверяем статус ответа
-              (let [result (json/parse-string (:body response) true)] ;; Парсим результат
+                                             :headers {"Content-Type" "application/json"}})))]  ;; Заголовки для JSON
+            (if (= 200 (:status response))  ;; Если статус ответа успешный
+              (let [result (json/parse-string (:body response) true)]  ;; Парсим тело ответа
                 (when result
-                  (println "Result:" result))
-                (>! response-chan result) ;; Отправляем результат в канал
+                  (println "Result:" result))  ;; Выводим результат
+                (>! response-chan result)  ;; Отправляем результат в канал
                 (close! response-chan))  ;; Закрываем канал
               (do
-                (println "Failed to submit job:" (:status response) (:body response))
-                (>! response-chan nil) ;; В канал отправляем nil при ошибке
-                (close! response-chan)))))
-        response-chan) ;; Возвращаем канал с результатом
+                (println "Failed to submit job:" (:status response) (:body response))  ;; Если запрос не успешен
+                (>! response-chan nil)  ;; Отправляем nil в канал
+                (close! response-chan))))))  ;; Закрываем канал
       (do
-        (println "No server selected. Job not submitted.")
-        nil)))) ;; Если сервер не выбран, возвращаем nil
+        (println "No server selected. Job not submitted.")  ;; Если сервер не выбран
+        nil))))
 
-;; Регистрирует удалённую функцию на сервере
+;; Функция для регистрации удаленной функции на сервере
 (defn register-remote-function [name code]
-  (let [server (choose-server nil)] ;; Выбираем сервер
-    (if server
+  (let [server (choose-server nil)]  ;; Выбираем сервер без функции
+    (if server  ;; Если сервер выбран
       (try
-        (let [url (str "http://localhost:" (:port server) "/register-function") ;; URL регистрации функции
-              request-body (json/generate-string {:name name :code code})] ;; Формируем запрос
-          (println "Registering function..." name)
-          (let [response (client/post url {:body request-body :headers {"Content-Type" "application/json"}})] ;; Отправляем запрос
-            (if (= 200 (:status response)) ;; Проверяем статус ответа
+        (let [url (str "http://localhost:" (:port server) "/register-function")
+              request-body (json/generate-string {:name name :code code})]  ;; Формируем запрос для регистрации функции
+          (println "Registering function..." name)  ;; Выводим сообщение о регистрации функции
+          (let [response (client/post url  ;; Отправляем запрос на сервер
+                                      {:body request-body
+                                       :headers {"Content-Type" "application/json"}})]
+            (if (= 200 (:status response))  ;; Если функция успешно зарегистрирована
               (println "Function registered:" name)
-              (println "Failed to register function:" (:status response) (:body response)))))
+              (println "Failed to register function:" (:status response) (:body response)))))  ;; Ошибка регистрации
         (catch Exception e
-          (println "Connection error:" (.getMessage e)))) ;; Ловим ошибки соединения
-      (println "No server selected. Function not registered.")))) ;; Если сервер не выбран, регистрация невозможна
+          (println "Connection error:" (.getMessage e))))  ;; Обработка ошибок при подключении
+    (println "No server selected. Function not registered.")))  ;; Если сервер не выбран, не регистрируем функцию
 
-;; Параллельное выполнение функции `map`
+;; Пример регистрации удаленной функции вычитания
+(register-remote-function "subtract" "(fn [a b] (- a b))")
+
+;; Параллельное выполнение функции map
 (defn parallel-map [func args]
-  (let [results (atom (vec (repeat (count args) nil))) ;; Создаем атом для хранения результатов
-        jobs (chan)] ;; Канал для отслеживания завершения задач
-    (doseq [idx (range (count args))] ;; Перебираем индексы всех аргументов
-      (let [arg (nth args idx)] ;; Получаем аргумент по индексу
+  (let [results (atom (vec (repeat (count args) nil)))  ;; Инициализируем результаты
+        jobs (chan)]  ;; Канал для отслеживания завершения задач
+    (doseq [idx (range (count args))]  ;; Для каждого аргумента
+      (let [arg (nth args idx)]
         (go
-          (let [result (<! (submit-job func [arg arg] nil nil))] ;; Отправляем задание на сервер
+          (let [result (<! (submit-job func [arg arg] nil nil))]  ;; Отправляем задание на сервер
             (when result
-              (swap! results assoc idx (:result result)) ;; Обновляем результаты в атоме
-              (>! jobs :done)))))) ;; Отправляем сигнал завершения в канал
-    ;; Ждем завершения всех задач
+              (swap! results assoc idx (:result result))  ;; Сохраняем результат в атом
+              (>! jobs :done)))))  ;; Отправляем сообщение о завершении работы
     (go
-      (dotimes [_ (count args)]
-        (<! jobs)) ;; Читаем из канала сигналы завершения
-      @results))) ;; Возвращаем результаты
+      (dotimes [_ (count args)]  ;; Ожидаем завершения всех задач
+        (<! jobs))
+      @results)))  ;; Возвращаем результаты
 
-;; Пример отправки и выполнения Clojure-кода
+;; Пример отправки Clojure-кода на выполнение
 (defn submit-clojure-code-example []
-  (let [code "(+ 10 2)"] ;; Пример кода на Clojure
+  (let [code "(+ 10 2)"]  ;; Пример кода на Clojure
     (println "Submitting Clojure code...")
-    (let [result (submit-job nil nil code nil)] ;; Отправляем задание с кодом
+    (let [result (submit-job nil nil code nil)]  ;; Отправляем код на выполнение
       (when result
-        (println "Result of executing Clojure code:" result))))) ;; Печатаем результат выполнения
+        (println "Result of executing Clojure code:" result)))))  ;; Выводим результат
 
 ;; Пример отправки Java-объекта
 (defn submit-java-object-example []
-  (let [person {:name "Alice" :age 30}] ;; Пример объекта
+  (let [person {:name "Alice" :age 30}]  ;; Пример объекта Java
     (println "Submitting Java object...")
-    (let [result (submit-job nil nil nil person)] ;; Отправляем задание с Java-объектом
+    (let [result (submit-job nil nil nil person)]  ;; Отправляем объект на сервер
       (when result
-        (println "Result of sending Java object:" result))))) ;; Печатаем результат выполнения
+        (println "Result of sending Java object:" result)))))  ;; Выводим результат
 
-;; Пример отправки удалённой функции для выполнения
+;; Пример отправки удаленной функции
 (defn submit-remote-function-example []
-  (let [func 'add  ;; Имя удалённой функции
-        args [6 7]] ;; Аргументы для функции
+  (let [func 'add
+        args [6 7]]  ;; Пример аргументов для функции
     (println "Submitting remote function...")
-    (let [result (submit-job func args nil nil)] ;; Отправляем задание с функцией
-      (when result
-        (println "Result of remote function:" (:result result)))))) ;; Печатаем результат выполнения
+    (let [result (submit-job func args nil nil)])))  ;; Отправляем удаленную функцию на выполнение
 
 ;; Пример использования parallel-map
 (defn submit-parallel-map-example []
-  (let [func 'add ;; Указываем имя функции
-        args [1 2 3 4 5]] ;; Список аргументов
+  (let [func 'add
+        args [1 2 3 4 5]]  ;; Пример аргументов для параллельного выполнения
     (println "Submitting parallel map...")
-    (let [results (parallel-map func args)] ;; Вызываем параллельное выполнение
-      (println "Results of parallel map:" results)))) ;; Печатаем результаты выполнения
+    (let [results (parallel-map func args)]  ;; Выполняем параллельное выполнение
+      (println "Results of parallel map:" results))))  ;; Выводим результаты
 
-;; Пример отправки другой удалённой функции
+;; Пример отправки удаленной функции
 (defn submit-remote-function-example_new []
-  (let [func 'subtract  ;; Имя другой функции
-        args [17 7]] ;; Аргументы
+  (let [func 'subtract
+        args [17 7]]  ;; Пример функции вычитания
     (println "Submitting remote function...")
-    (let [result (submit-job func args nil nil)] ;; Отправляем задание
+    (let [result (submit-job func args nil nil)]  ;; Отправляем функцию на выполнение
       (when result
-        (println "Result of remote function:" (:result result)))))) ;; Печатаем результат выполнения
+        (println "Result of remote function:" (:result result)))))  ;; Выводим результат
 
-;; Последовательное выполнение примеров
-(submit-clojure-code-example) ;; Пример выполнения Clojure-кода
-(submit-java-object-example) ;; Пример отправки Java-объекта
-(submit-remote-function-example) ;; Пример вызова удаленной функции
-(submit-parallel-map-example) ;; Пример параллельного выполнения
-(submit-remote-function-example_new) ;; Пример вызова другой функции
+;; Примеры использования
+(submit-clojure-code-example)
+(submit-java-object-example)
+(submit-remote-function-example)
+(submit-parallel-map-example)
+(submit-remote-function-example_new)
+
 
